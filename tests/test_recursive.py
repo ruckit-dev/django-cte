@@ -2,6 +2,7 @@ from __future__ import absolute_import
 from __future__ import print_function
 from __future__ import unicode_literals
 
+import pickle
 from unittest import SkipTest
 
 from django.db.models import IntegerField, TextField
@@ -21,7 +22,7 @@ from django.test import TestCase
 
 from django_cte import With
 
-from .models import Region
+from .models import KeyPair, Region
 
 int_field = IntegerField()
 text_field = TextField()
@@ -192,3 +193,109 @@ class TestRecursiveCTE(TestCase):
 
         data = [r.name for r in regions]
         self.assertEqual(data, ['earth', 'moon', 'sun'])
+
+    def test_pickle_recursive_cte_queryset(self):
+        def make_regions_cte(cte):
+            return Region.objects.filter(
+                parent__isnull=True
+            ).annotate(
+                depth=Value(0, output_field=int_field),
+            ).union(
+                cte.join(Region, parent=cte.col.name).annotate(
+                    depth=cte.col.depth + Value(1, output_field=int_field),
+                ),
+                all=True,
+            )
+        cte = With.recursive(make_regions_cte)
+        regions = cte.queryset().with_cte(cte).filter(depth=2).order_by("name")
+
+        pickled_qs = pickle.loads(pickle.dumps(regions))
+
+        data = [(r.name, r.depth) for r in pickled_qs]
+        self.assertEqual(data, [(r.name, r.depth) for r in regions])
+        self.assertEqual(data, [('deimos', 2), ('moon', 2), ('phobos', 2)])
+
+    def test_alias_change_in_annotation(self):
+        def make_regions_cte(cte):
+            return Region.objects.filter(
+                parent__name="sun",
+            ).annotate(
+                value=F('name'),
+            ).union(
+                cte.join(
+                    Region.objects.all().annotate(
+                        value=F('name'),
+                    ),
+                    parent_id=cte.col.name,
+                ),
+                all=True,
+            )
+        cte = With.recursive(make_regions_cte)
+        query = cte.queryset().with_cte(cte)
+
+        exclude_leaves = With(cte.queryset().filter(
+            parent__name='sun',
+        ).annotate(
+            value=Concat(F('name'), F('name'))
+        ), name='value_cte')
+
+        query = query.annotate(
+            _exclude_leaves=Exists(
+                exclude_leaves.queryset().filter(
+                    name=OuterRef("name"),
+                    value=OuterRef("value"),
+                )
+            )
+        ).filter(_exclude_leaves=True).with_cte(exclude_leaves)
+        print(query.query)
+
+        # Nothing should be returned.
+        self.assertFalse(query)
+
+    def test_alias_as_subquery(self):
+        # This test covers CTEColumnRef.relabeled_clone
+        def make_regions_cte(cte):
+            return KeyPair.objects.filter(
+                parent__key="level 1",
+            ).annotate(
+                rank=F('value'),
+            ).union(
+                cte.join(
+                    KeyPair.objects.all().order_by(),
+                    parent_id=cte.col.id,
+                ).annotate(
+                    rank=F('value'),
+                ),
+                all=True,
+            )
+        cte = With.recursive(make_regions_cte)
+        children = cte.queryset().with_cte(cte)
+
+        xdups = With(cte.queryset().filter(
+            parent__key="level 1",
+        ).annotate(
+            rank=F('value')
+        ).values('id', 'rank'), name='xdups')
+
+        children = children.annotate(
+            _exclude=Exists(
+                (
+                    xdups.queryset().filter(
+                        id=OuterRef("id"),
+                        rank=OuterRef("rank"),
+                    )
+                )
+            )
+        ).filter(_exclude=True).with_cte(xdups)
+
+        print(children.query)
+        query = KeyPair.objects.filter(parent__in=children)
+        print(query.query)
+        print(children.query)
+        self.assertEqual(query.get().key, 'level 3')
+        # Tests the case in which children's query was modified since it was
+        # used in a subquery to define `query` above.
+        self.assertEqual(
+            list(c.key for c in children),
+            ['level 2', 'level 2']
+        )

@@ -1,5 +1,8 @@
 # Common Table Expressions (CTE) for Django
 
+[![Build Status](https://travis-ci.org/dimagi/django-cte.png)](https://travis-ci.org/dimagi/django-cte)
+[![PyPI version](https://badge.fury.io/py/django-cte.svg)](https://badge.fury.io/py/django-cte)
+
 ## Installation
 ```
 pip install django-cte
@@ -106,17 +109,10 @@ flake8 --config=setup.cfg
 
 ## Uploading to PyPI
 
-Optional: install `pandoc` for prettier README on PyPI. Use your preferred
-package manager to do this. Then install `pypandoc`.
+Package and upload the generated files.
 
 ```
-pip install pypandoc
-```
-
-Finally package and upload the generated files.
-
-```
-pip install twine wheel
+pip install -r pkg-requires.txt
 
 python setup.py sdist bdist_wheel
 twine upload dist/*

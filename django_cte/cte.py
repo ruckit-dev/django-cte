@@ -1,11 +1,12 @@
 from __future__ import absolute_import
 from __future__ import unicode_literals
 
-import django
 from django.db.models import Manager
-from django.db.models.query import QuerySet
+from django.db.models.query import Q, QuerySet, ValuesIterable
+from django.db.models.sql.datastructures import BaseTable
 
-from .meta import CTEColumns, CTEModel
+from .join import QJoin, INNER
+from .meta import CTEColumnRef, CTEColumns
 from .query import CTEQuery
 
 __all__ = ["With", "CTEManager", "CTEQuerySet"]
@@ -23,8 +24,15 @@ class With(object):
     """
 
     def __init__(self, queryset, name="cte"):
-        self._queryset = queryset
+        self.query = None if queryset is None else queryset.query
         self.name = name
+        self.col = CTEColumns(self)
+
+    def __getstate__(self):
+        return (self.query, self.name)
+
+    def __setstate__(self, state):
+        self.query, self.name = state
         self.col = CTEColumns(self)
 
     def __repr__(self):
@@ -42,7 +50,7 @@ class With(object):
         :returns: The fully constructed recursive cte object.
         """
         cte = cls(None, name)
-        cte._queryset = make_cte_queryset(cte)
+        cte.query = make_cte_queryset(cte).query
         return cte
 
     def join(self, model_or_queryset, *filter_q, **filter_kw):
@@ -66,48 +74,51 @@ class With(object):
         if isinstance(model_or_queryset, QuerySet):
             queryset = model_or_queryset.all()
         else:
-            queryset = model_or_queryset.objects.all()
+            queryset = model_or_queryset._default_manager.all()
+        join_type = filter_kw.pop("_join_type", INNER)
         query = queryset.query
-        self._add_to_query(query)
-        return queryset.filter(*filter_q, **filter_kw)
 
-    def queryset(self, model=None):
+        # based on Query.add_q: add necessary joins to query, but no filter
+        q_object = Q(*filter_q, **filter_kw)
+        map = query.alias_map
+        existing_inner = set(a for a in map if map[a].join_type == INNER)
+        on_clause, _ = query._add_q(q_object, query.used_aliases)
+        query.demote_joins(existing_inner)
+
+        parent = query.get_initial_alias()
+        query.join(QJoin(parent, self.name, self.name, on_clause, join_type))
+        return queryset
+
+    def queryset(self):
         """Get a queryset selecting from this CTE
 
-        This CTE will be refernced by the returned queryset, but the
+        This CTE will be referenced by the returned queryset, but the
         corresponding `WITH ...` statement will not be prepended to the
         queryset's SQL output; use `<CTEQuerySet>.with_cte(cte)` to
         achieve that outcome.
 
-        :param model: Optional model class to use as the queryset's
-        primary model. If this is provided the CTE will be added to
-        the queryset's table list and join conditions may be added
-        with a subsequent `.filter(...)` call.
         :returns: A queryset.
         """
-        query = CTEQuery(model)
-        if model is None:
-            model = query.model = CTEModel(self, query)
-        else:
-            self._add_to_query(query)
-        return CTEQuerySet(model, query)
+        cte_query = self.query
+        qs = cte_query.model._default_manager.get_queryset()
 
-    def _add_to_query(self, query):
-        django1 = django.VERSION < (2, 0)
-        tables = query.tables if django1 else query.extra_tables
-        if not tables:
-            # prevent CTE becoming the initial alias
-            query.get_initial_alias()
-        name = self.name
-        if name in tables:
-            raise ValueError(
-                "cannot add CTE with name '%s' because an entity with that "
-                "name is already referenced in this query's FROM clause" % name
-            )
-        query.extra_tables += (name,)
+        query = CTEQuery(cte_query.model)
+        query.join(BaseTable(self.name, None))
+        query.default_cols = cte_query.default_cols
+        if cte_query.annotations:
+            for alias, value in cte_query.annotations.items():
+                col = CTEColumnRef(alias, self.name, value.output_field)
+                query.add_annotation(col, alias)
+        if cte_query.values_select:
+            query.set_values(cte_query.values_select)
+            qs._iterable_class = ValuesIterable
+        query.annotation_select_mask = cte_query.annotation_select_mask
+
+        qs.query = query
+        return qs
 
     def _resolve_ref(self, name):
-        return self._queryset.query.resolve_ref(name)
+        return self.query.resolve_ref(name)
 
 
 class CTEManager(Manager):

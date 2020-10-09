@@ -10,7 +10,7 @@ from django.db.models.sql.compiler import (
     SQLUpdateCompiler,
 )
 
-from .meta import CTEModel
+from .expressions import CTESubqueryResolver
 
 
 class CTEQuery(Query):
@@ -44,11 +44,13 @@ class CTEQuery(Query):
         klass = COMPILER_TYPES.get(self.__class__, CTEQueryCompiler)
         return klass(self, connection, using)
 
+    def add_annotation(self, annotation, *args, **kw):
+        annotation = CTESubqueryResolver(annotation)
+        super(CTEQuery, self).add_annotation(annotation, *args, **kw)
+
     def __chain(self, _name, klass=None, *args, **kwargs):
         klass = QUERY_TYPES.get(klass, self.__class__)
         clone = getattr(super(CTEQuery, self), _name)(klass, *args, **kwargs)
-        if isinstance(clone.model, CTEModel):
-            clone.model = clone.model._copy_for_query(clone)
         clone._with_ctes = self._with_ctes[:]
         return clone
 
@@ -73,7 +75,7 @@ class CTECompiler(object):
         ctes = []
         params = []
         for cte in query._with_ctes:
-            compiler = cte._queryset.query.get_compiler(connection=connection)
+            compiler = cte.query.get_compiler(connection=connection)
             cte_sql, cte_params = compiler.as_sql()
             ctes.append(cls.TEMPLATE.format(name=cte.name, query=cte_sql))
             params.extend(cte_params)
